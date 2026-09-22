@@ -20,7 +20,8 @@
  */
 
 const PLUGIN_ID = 'blockbench_git';
-const LFS_DEFAULT_EXTS = 'png,jpg,jpeg,gif,webp,tga,bmp';
+const LFS_DEFAULT_EXTS = 'png,jpg,jpeg,gif,webp,tga,bmp,bbmodel';
+const LFS_OLD_DEFAULT_EXTS = 'png,jpg,jpeg,gif,webp,tga,bmp'; // 旧版本默认值，用于存量设置迁移
 const GITIGNORE_CONTENT = '.DS_Store\nThumbs.db\ndesktop.ini\n*.tmp\n.bbgit_preview/\n';
 const PREVIEW_DIR_NAME = '.bbgit_preview';
 
@@ -482,6 +483,15 @@ function setRemoteUrl(st) {
 	}, { placeholder: 'https://github.com/user/repo.git 或 git@github.com:user/repo.git', description: '配置后可用旁边的按钮拉取并查看与远程的差距' });
 }
 
+function isValidBranchName(name) {
+	// git-check-ref-format 的常用规则子集
+	if (!name || typeof name !== 'string' || /\s/.test(name)) return false;
+	if (/^[\/-]/.test(name) || /\/$/.test(name) || /\.lock$/i.test(name)) return false;
+	if (/[~^:?*\[\\]/.test(name)) return false;
+	if (name.includes('..') || name.includes('@{') || name.includes('//')) return false;
+	return true;
+}
+
 async function resolveUpstreamRef(st) {
 	// 返回上游分支引用（@{upstream} 或 origin/<branch>），不存在时返回 null
 	let up = await gitRun(st.root, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']);
@@ -587,6 +597,148 @@ async function forcePull(st, cleanUntracked) {
 		st.busy = false;
 		syncVm();
 	}
+}
+
+async function doCheckoutBranch(st, name) {
+	if (st.busy) return false;
+	st.busy = true;
+	syncVm();
+	try {
+		await runOrThrow(st.root, ['checkout', name]);
+		st.saveCount = 0;
+		st.lastCommitTs = Date.now();
+		await refreshStatus(st);
+		toastOK(`已切换到分支 ${name}，请重新打开工程加载该版本`);
+		return true;
+	} catch (e) {
+		showGitError(e);
+		return false;
+	} finally {
+		st.busy = false;
+		syncVm();
+	}
+}
+
+function doSwitchBranch(st, name) {
+	if (!st.view.clean) {
+		Blockbench.showMessageBox({
+			title: '切换分支',
+			icon: 'warning',
+			message: `工作区有 ${st.view.files.length} 个未提交的变更，切换分支时它们可能跟随到新分支或导致冲突。建议先提交或放弃更改。仍要继续？`,
+			buttons: ['仍要切换', '取消'],
+			confirmIndex: 0,
+			cancelIndex: 1
+		}, async btn => {
+			if (btn === 0) await doCheckoutBranch(st, name);
+		});
+		return;
+	}
+	doCheckoutBranch(st, name);
+}
+
+async function switchBranchDialog(st) {
+	if (st.busy) return;
+	let r = await gitRun(st.root, ['for-each-ref', 'refs/heads', '--format=%(refname:short)|%(HEAD)|%(subject)']);
+	if (r.code !== 0) {
+		showGitError(new Error((r.stderr || '无法读取分支列表').trim()));
+		return;
+	}
+	let branches = r.stdout.split('\n').filter(Boolean).map(line => {
+		let [name, head, ...rest] = line.split('|');
+		return { name: name.trim(), current: head.trim() === '*', subject: rest.join('|') };
+	});
+	if (!branches.length) {
+		toastError('没有本地分支');
+		return;
+	}
+	let commands = {};
+	for (let b of branches) {
+		commands[b.name] = {
+			text: b.name + (b.current ? '（当前分支）' : ''),
+			icon: b.current ? 'check' : 'call_split',
+			description: b.subject || undefined
+		};
+	}
+	Blockbench.showMessageBox({
+		title: '切换分支',
+		icon: 'call_split',
+		message: `选择要切换到的本地分支（当前：${st.view.branch || 'HEAD'}）。切换后请重新打开工程以加载该分支的版本。`,
+		commands,
+		buttons: ['取消'],
+		confirmIndex: 0,
+		cancelIndex: 0
+	}, id => {
+		if (typeof id === 'string' && id !== st.view.branch) doSwitchBranch(st, id);
+	});
+}
+
+function createBranch(st) {
+	Blockbench.textPrompt('创建并切换分支', '', name => {
+		name = (name || '').trim();
+		if (!name) return;
+		if (!isValidBranchName(name)) {
+			toastError('分支名称不合法（不能包含空格或 ~ ^ : ? * [ \\ 等字符）');
+			return;
+		}
+		if (st.busy) return;
+		st.busy = true;
+		syncVm();
+		gitRun(st.root, ['checkout', '-b', name]).then(async r => {
+			if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+			st.saveCount = 0;
+			st.lastCommitTs = Date.now();
+			await refreshStatus(st);
+			toastOK(`已创建并切换到分支 ${name}`);
+		}).catch(e => {
+			showGitError(e);
+		}).finally(() => {
+			st.busy = false;
+			syncVm();
+		});
+	}, { placeholder: 'feature/my-branch', description: '基于当前提交创建新分支并切换过去' });
+}
+
+function pushBackupBranch(st) {
+	let d = new Date();
+	let stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+	let suggested = 'backup/' + (st.view.branch || 'head').replace(/\//g, '-') + '-' + stamp;
+	Blockbench.textPrompt('推送备份分支', suggested, async name => {
+		name = (name || '').trim();
+		if (!name) return;
+		if (!isValidBranchName(name)) {
+			toastError('分支名称不合法（不能包含空格或 ~ ^ : ? * [ \\ 等字符）');
+			return;
+		}
+		if (!(await getRemoteUrl(st.root))) {
+			toastError('未配置远程仓库，请先点击“设置远程”按钮');
+			return;
+		}
+		if (st.busy) return;
+		st.busy = true;
+		syncVm();
+		try {
+			await runOrThrow(st.root, ['push', 'origin', 'HEAD:refs/heads/' + name]);
+			toastOK(`已将当前提交推送为远程备份分支 ${name}`);
+			await refreshStatus(st);
+		} catch (e) {
+			showGitError(e);
+		} finally {
+			st.busy = false;
+			syncVm();
+		}
+	}, {
+		description: st.view.clean
+			? '将当前提交推送为远程上的一个新分支，不影响本地与主分支'
+			: '注意：工作区有未提交的更改，备份只包含已提交的内容'
+	});
+}
+
+async function branchMenu(st, e) {
+	new Menu([
+		{ name: '切换分支…', icon: 'swap_horiz', click: () => switchBranchDialog(st) },
+		{ name: '创建并切换分支…', icon: 'add_circle_outline', click: () => createBranch(st) },
+		{ name: '推送备份分支…', icon: 'cloud_upload', click: () => pushBackupBranch(st) }
+	]).open(e);
 }
 
 async function discardChanges(st) {
@@ -773,7 +925,7 @@ async function autoConfigGitFilters(root) {
 	try {
 		let addedAttrs = await ensureLfsAttributes(root, exts);
 		let addedIgnore = ensureGitignore(root);
-		if (addedAttrs.length) toastOK('已补充 LFS 图像追踪：' + addedAttrs.map(e => '*.' + e).join('、'));
+		if (addedAttrs.length) toastOK('已补充 LFS 追踪：' + addedAttrs.map(e => '*.' + e).join('、'));
 		if (addedIgnore) toastOK('已补全 .gitignore 默认条目');
 	} catch (e) {
 		console.warn('[blockbench_git] 自动配置过滤规则跳过：' + (e.message || e));
@@ -859,8 +1011,8 @@ function openInitDialog() {
 		width: 480,
 		form: {
 			root: { label: '仓库位置', type: 'folder', value: defaultRepoRoot(), description: '选择 Git 仓库根目录（默认为工程文件所在目录）' },
-			lfs: { label: '启用 LFS 图像追踪（GitHub Xet 兼容）', type: 'checkbox', value: true },
-			exts: { label: 'LFS 追踪的图像扩展名（逗号分隔）', type: 'text', value: settings.git_lfs_extensions.value },
+			lfs: { label: '启用 LFS 追踪（.bbmodel 与图像，GitHub Xet 兼容）', type: 'checkbox', value: true },
+			exts: { label: 'LFS 追踪的扩展名（逗号分隔，含 .bbmodel）', type: 'text', value: settings.git_lfs_extensions.value },
 			gitignore: { label: '生成 .gitignore（系统文件与临时文件）', type: 'checkbox', value: true },
 			commit0: { label: '创建初始提交', type: 'checkbox', value: true }
 		},
@@ -1014,6 +1166,11 @@ function buildGitPanel() {
 						{ name: '强制拉取（远程覆盖本地）', icon: 'cloud_download', click: () => this.forcePullNow() }
 					]).open(e);
 				},
+				openBranchMenu(e) {
+					let st = selectedState();
+					if (!st || st.busy) return;
+					branchMenu(st, e);
+				},
 				forcePushNow() {
 					let st = selectedState();
 					if (!st) return;
@@ -1087,10 +1244,11 @@ function buildGitPanel() {
 	</div>
 
 	<div v-if="page === 'status'">
-	<div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
+		<div style="display:flex; gap:8px; align-items:center; margin-bottom:8px; flex-wrap:wrap;">
 		<template v-if="hasRepo">
 			<i class="material-icons" style="font-size:16px;">device_hub</i>
 			<b>{{ branch || 'HEAD' }}</b>
+			<div class="tool" title="分支：切换 / 创建 / 推送备份" @click="openBranchMenu($event)"><i class="material-icons">call_split</i></div>
 			<span v-if="ahead || behind" style="color:var(--color-subtle);">↑{{ ahead }} ↓{{ behind }}</span>
 			<span :style="{color: clean ? 'var(--color-confirm)' : 'var(--color-error)'}">
 				{{ clean ? '工作区干净' : (files.length + ' 个变更') }}
@@ -1208,9 +1366,9 @@ function buildGitPanel() {
 			<div style="color:var(--color-subtle); font-size:11px; margin-top:3px;">占位符：{date} 日期、{time} 时间</div>
 		</div>
 		<div>
-			<div style="margin-bottom:4px;">LFS 图像扩展名</div>
+			<div style="margin-bottom:4px;">LFS 追踪扩展名</div>
 			<input type="text" class="dark_bordered" v-model.trim="s.lfsExts" @change="applySettings()" style="width:100%;">
-			<div style="color:var(--color-subtle); font-size:11px; margin-top:3px;">逗号分隔；初始化仓库与打开工程自动补全时使用</div>
+			<div style="color:var(--color-subtle); font-size:11px; margin-top:3px;">逗号分隔；初始化仓库与打开工程自动补全时使用（含 .bbmodel 工程文件与图像）</div>
 		</div>
 		<div>
 			<div style="margin-bottom:4px;">git 可执行文件路径</div>
@@ -1253,8 +1411,26 @@ async function refreshPanel() {
 // 设置
 // ------------------------------------------------------------------
 
+function registerGitCategory() {
+	// 不能在插件 onload 里直接调 Settings.addCategory：设置对话框懒构建，
+	// 首次打开前 dialog.object 为 undefined，addCategory 内的 sidebar.build() 会崩溃。
+	// 这里手动注册分类并按时机安全地更新侧栏。
+	if (!Settings.structure.git) {
+		Settings.structure.git = { name: 'Git', open: false, items: {} };
+	}
+	if (Settings.dialog && Settings.dialog.sidebar) {
+		let sidebar = Settings.dialog.sidebar;
+		if (!sidebar.pages.git) {
+			sidebar.pages.git = 'Git';
+			if (sidebar.dialog && sidebar.dialog.object) {
+				try { sidebar.build(); } catch (e) { console.warn('[blockbench_git] 设置侧栏更新跳过：', e); }
+			}
+		}
+	}
+}
+
 function registerSettings() {
-	Settings.addCategory('git', { name: 'Git' });
+	registerGitCategory();
 	let defs = [
 		['git_auto_commit_mode', {
 			type: 'select', value: 'both', category: 'git',
@@ -1294,8 +1470,8 @@ function registerSettings() {
 		}],
 		['git_lfs_extensions', {
 			type: 'text', value: LFS_DEFAULT_EXTS, category: 'git',
-			name: 'Git LFS 图像扩展名',
-			description: '初始化仓库与打开工程自动补全时追踪的图像文件扩展名（逗号分隔）'
+			name: 'Git LFS 追踪扩展名',
+			description: '初始化仓库与打开工程自动补全时用 LFS 追踪的扩展名（逗号分隔，含 .bbmodel 工程文件与图像）'
 		}],
 		['git_path', {
 			type: 'text', value: 'git', category: 'git',
@@ -1306,6 +1482,10 @@ function registerSettings() {
 	];
 	for (let [id, data] of defs) {
 		P.settingDefs.push(new Setting(id, data));
+	}
+	// 存量迁移：用户从未自定义过扩展名列表（仍为旧默认值）时，补上 bbmodel
+	if (settings.git_lfs_extensions.value === LFS_OLD_DEFAULT_EXTS) {
+		settings.git_lfs_extensions.set(LFS_DEFAULT_EXTS);
 	}
 }
 
@@ -1425,6 +1605,8 @@ if (typeof module !== 'undefined' && module && module.exports) {
 		parseExts, ensureLfsAttributes, ensureGitignore, autoConfigGitFilters,
 		getRemoteUrl, setRemoteUrl, fetchRemoteGap, resolveUpstreamRef, forcePush, forcePull,
 		isPreviewPath, refreshPreviews, previewCommit, openPreviewProject, closePreview,
+		isValidBranchName, doCheckoutBranch, doSwitchBranch, switchBranchDialog, createBranch, pushBackupBranch, branchMenu,
+		registerGitCategory,
 		onload, onunload, registerSettings, registerActions, registerEvents,
 		resetToCommit, discardChanges, openInitDialog, openGitPanel, buildGitPanel, refreshPanel
 	};
